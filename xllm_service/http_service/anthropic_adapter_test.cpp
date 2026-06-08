@@ -266,6 +266,37 @@ TEST(AnthropicAdapterTest, RejectsUnknownMessageBlocks) {
                 "Unsupported Anthropic content block type: audio");
 }
 
+TEST(AnthropicAdapterTest, AllowsTextStreamingRequest) {
+  auto request = parse_request(R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "hello"}
+    ]
+  })");
+
+  xllm::proto::ChatRequest chat_request;
+  ChatMessages messages;
+  auto result = adapt_request(request, &chat_request, &messages);
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_TRUE(chat_request.has_stream());
+  EXPECT_TRUE(chat_request.stream());
+}
+
+TEST(AnthropicAdapterTest, RejectsStreamingToolsUntilToolDeltas) {
+  expect_reject(R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "stream": true,
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    "messages": [
+      {"role": "user", "content": "hello"}
+    ]
+  })",
+                "Anthropic streaming tools are not supported yet.");
+}
+
 TEST(AnthropicAdapterTest, MapsToolsAndDefaultToolChoices) {
   auto request = parse_request(R"({
     "model": "test-model",
@@ -495,6 +526,82 @@ TEST(AnthropicAdapterTest, BuildsToolUseAnthropicJson) {
   EXPECT_EQ(json["content"][1]["id"], "call_1");
   EXPECT_EQ(json["content"][1]["name"], "get_weather");
   EXPECT_EQ(json["content"][1]["input"]["city"], "Beijing");
+}
+
+TEST(AnthropicAdapterTest, BuildsTextStreamEvents) {
+  AnthropicStreamState state;
+  std::vector<xllm::proto::AnthropicStreamEvent> events;
+
+  llm::RequestOutput first;
+  first.request_id = "anthropiccmpl-test";
+  llm::SequenceOutput first_seq;
+  first_seq.index = 0;
+  first_seq.text = "Hel";
+  first.outputs.push_back(std::move(first_seq));
+
+  auto result =
+      fill_anthropic_stream_events("test-model", first, &state, &events);
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_EQ(events.size(), 3);
+  EXPECT_EQ(events[0].type(), "message_start");
+  EXPECT_EQ(events[0].message().id(), "anthropiccmpl-test");
+  EXPECT_EQ(events[0].message().usage().input_tokens(), 0);
+  EXPECT_EQ(events[0].message().usage().output_tokens(), 0);
+  EXPECT_EQ(events[1].type(), "content_block_start");
+  EXPECT_EQ(events[1].index(), 0);
+  EXPECT_EQ(events[1].content_block().type(), "text");
+  EXPECT_EQ(events[1].content_block().text(), "");
+  EXPECT_EQ(events[2].type(), "content_block_delta");
+  EXPECT_EQ(events[2].index(), 0);
+  EXPECT_EQ(events[2].delta().type(), "text_delta");
+  EXPECT_EQ(events[2].delta().text(), "Hel");
+
+  llm::RequestOutput second;
+  second.request_id = "anthropiccmpl-test";
+  llm::SequenceOutput second_seq;
+  second_seq.index = 0;
+  second_seq.text = "lo";
+  second.outputs.push_back(std::move(second_seq));
+  events.clear();
+
+  result = fill_anthropic_stream_events("test-model", second, &state, &events);
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_EQ(events.size(), 1);
+  EXPECT_EQ(events[0].type(), "content_block_delta");
+  EXPECT_EQ(events[0].delta().text(), "lo");
+
+  llm::RequestOutput final;
+  final.request_id = "anthropiccmpl-test";
+  final.finished = true;
+  llm::SequenceOutput final_seq;
+  final_seq.index = 0;
+  final_seq.finish_reason = "stop";
+  final.outputs.push_back(std::move(final_seq));
+  llm::Usage usage;
+  usage.num_prompt_tokens = 3;
+  usage.num_generated_tokens = 5;
+  final.usage = usage;
+  events.clear();
+
+  result = fill_anthropic_stream_events("test-model", final, &state, &events);
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_EQ(events.size(), 3);
+  EXPECT_EQ(events[0].type(), "content_block_stop");
+  EXPECT_EQ(events[0].index(), 0);
+  EXPECT_EQ(events[1].type(), "message_delta");
+  EXPECT_EQ(events[1].delta().stop_reason(), "end_turn");
+  EXPECT_EQ(events[1].usage().input_tokens(), 3);
+  EXPECT_EQ(events[1].usage().output_tokens(), 5);
+  EXPECT_EQ(events[2].type(), "message_stop");
+
+  std::string sse;
+  std::string error;
+  ASSERT_TRUE(anthropic_event_sse(events[1], &sse, &error)) << error;
+  EXPECT_NE(sse.find("event: message_delta\n"), std::string::npos);
+  EXPECT_NE(sse.find("\ndata: {"), std::string::npos);
+  EXPECT_NE(sse.find("\"stop_reason\":\"end_turn\""), std::string::npos);
+  EXPECT_EQ(sse.substr(sse.size() - 2), "\n\n");
+  EXPECT_EQ(anthropic_done_sse(), "data: [DONE]\n\n");
 }
 
 TEST(AnthropicAdapterTest, MapsLengthStopReason) {

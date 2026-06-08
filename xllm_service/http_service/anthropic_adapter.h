@@ -15,7 +15,9 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "anthropic.pb.h"
 #include "chat.pb.h"
@@ -27,6 +29,12 @@ namespace xllm_service {
 struct AnthropicAdaptResult {
   bool ok = true;
   std::string error;
+};
+
+struct AnthropicStreamState {
+  bool message_started = false;
+  int32_t content_block_index = -1;
+  std::string last_content_block_type;
 };
 
 std::string new_anthropic_id();
@@ -47,8 +55,20 @@ AnthropicAdaptResult fill_anthropic_resp(
     const google::protobuf::RepeatedPtrField<xllm::proto::ToolCall>* tool_calls =
         nullptr);
 
+AnthropicAdaptResult fill_anthropic_stream_events(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events);
+
 bool anthropic_json(const xllm::proto::AnthropicMessagesResponse& response,
                     std::string* json,
                     std::string* error);
+
+bool anthropic_event_sse(const xllm::proto::AnthropicStreamEvent& event,
+                         std::string* sse,
+                         std::string* error);
+
+std::string anthropic_done_sse();
 
 }  // namespace xllm_service

@@ -372,6 +372,105 @@ void fill_usage(const llm::RequestOutput& request_output,
       static_cast<int32_t>(usage.num_generated_tokens));
 }
 
+void add_message_start(const std::string& model,
+                       const llm::RequestOutput& request_output,
+                       AnthropicStreamState* state,
+                       std::vector<xllm::proto::AnthropicStreamEvent>*
+                           events) {
+  if (state->message_started) {
+    return;
+  }
+
+  xllm::proto::AnthropicStreamEvent event;
+  event.set_type("message_start");
+  auto* message = event.mutable_message();
+  message->set_id(request_output.request_id);
+  message->set_type("message");
+  message->set_role("assistant");
+  message->set_model(model);
+  auto* usage = message->mutable_usage();
+  usage->set_input_tokens(0);
+  usage->set_output_tokens(0);
+
+  events->push_back(std::move(event));
+  state->message_started = true;
+}
+
+void add_block_stop(AnthropicStreamState* state,
+                    std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  if (state->content_block_index < 0) {
+    return;
+  }
+
+  xllm::proto::AnthropicStreamEvent event;
+  event.set_type("content_block_stop");
+  event.set_index(state->content_block_index);
+  events->push_back(std::move(event));
+}
+
+void start_text_block(AnthropicStreamState* state,
+                      std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  if (state->last_content_block_type == "text") {
+    return;
+  }
+  if (!state->last_content_block_type.empty()) {
+    add_block_stop(state, events);
+  }
+
+  state->last_content_block_type = "text";
+  ++state->content_block_index;
+
+  xllm::proto::AnthropicStreamEvent event;
+  event.set_type("content_block_start");
+  event.set_index(state->content_block_index);
+  auto* content_block = event.mutable_content_block();
+  content_block->set_type("text");
+  content_block->set_text("");
+  events->push_back(std::move(event));
+}
+
+void add_text_delta(const std::string& text,
+                    const AnthropicStreamState& state,
+                    std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  xllm::proto::AnthropicStreamEvent event;
+  event.set_type("content_block_delta");
+  event.set_index(state.content_block_index);
+  auto* delta = event.mutable_delta();
+  delta->set_type("text_delta");
+  delta->set_text(text);
+  events->push_back(std::move(event));
+}
+
+void add_message_delta(
+    const llm::RequestOutput& request_output,
+    const std::string& finish_reason,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  xllm::proto::AnthropicStreamEvent event;
+  event.set_type("message_delta");
+  auto* delta = event.mutable_delta();
+  delta->set_stop_reason(
+      xllm::api_service::get_stream_stop_reason(true, false, finish_reason));
+
+  auto* usage = event.mutable_usage();
+  if (request_output.usage.has_value()) {
+    const auto& source_usage = request_output.usage.value();
+    usage->set_input_tokens(
+        static_cast<int32_t>(source_usage.num_prompt_tokens));
+    usage->set_output_tokens(
+        static_cast<int32_t>(source_usage.num_generated_tokens));
+  } else {
+    usage->set_input_tokens(0);
+    usage->set_output_tokens(0);
+  }
+  events->push_back(std::move(event));
+}
+
+void add_message_stop(std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  xllm::proto::AnthropicStreamEvent event;
+  event.set_type("message_stop");
+  events->push_back(std::move(event));
+}
+
 }  // namespace
 
 std::string new_anthropic_id() {
@@ -403,8 +502,11 @@ AnthropicAdaptResult fill_chat_req(
     const xllm::proto::AnthropicMessagesRequest& anthropic_request,
     xllm::proto::ChatRequest* chat_request,
     ChatMessages* messages) {
-  if (anthropic_request.has_stream() && anthropic_request.stream()) {
-    return error_result("Anthropic streaming is not supported yet.");
+  const bool streaming =
+      anthropic_request.has_stream() && anthropic_request.stream();
+  if (streaming && (anthropic_request.tools_size() > 0 ||
+                    anthropic_request.has_tool_choice())) {
+    return error_result("Anthropic streaming tools are not supported yet.");
   }
   if (anthropic_request.max_tokens() < 0) {
     return error_result("Anthropic max_tokens must be non-negative.");
@@ -482,6 +584,43 @@ AnthropicAdaptResult fill_anthropic_resp(
   return ok_result();
 }
 
+AnthropicAdaptResult fill_anthropic_stream_events(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  if (state == nullptr) {
+    return error_result("Anthropic stream state is required.");
+  }
+  if (events == nullptr) {
+    return error_result("Anthropic stream events output is required.");
+  }
+
+  std::string finish_reason;
+  for (const auto& seq_output : request_output.outputs) {
+    if (!seq_output.text.empty()) {
+      add_message_start(model, request_output, state, events);
+      start_text_block(state, events);
+      add_text_delta(seq_output.text, *state, events);
+    }
+    if (seq_output.finish_reason.has_value()) {
+      finish_reason = seq_output.finish_reason.value();
+    }
+  }
+
+  if (request_output.finished) {
+    add_message_start(model, request_output, state, events);
+    if (state->content_block_index >= 0) {
+      add_block_stop(state, events);
+      state->last_content_block_type.clear();
+    }
+    add_message_delta(request_output, finish_reason, events);
+    add_message_stop(events);
+  }
+
+  return ok_result();
+}
+
 bool anthropic_json(const xllm::proto::AnthropicMessagesResponse& response,
                     std::string* json,
                     std::string* error) {
@@ -491,5 +630,23 @@ bool anthropic_json(const xllm::proto::AnthropicMessagesResponse& response,
   return xllm::api_service::proto_to_anthropic_json(
       response, options, json, error);
 }
+
+bool anthropic_event_sse(const xllm::proto::AnthropicStreamEvent& event,
+                         std::string* sse,
+                         std::string* error) {
+  json2pb::Pb2JsonOptions options;
+  options.bytes_to_base64 = false;
+  options.jsonify_empty_array = true;
+
+  std::string json;
+  if (!xllm::api_service::proto_to_anthropic_json(
+          event, options, &json, error)) {
+    return false;
+  }
+  *sse = "event: " + event.type() + "\ndata: " + json + "\n\n";
+  return true;
+}
+
+std::string anthropic_done_sse() { return "data: [DONE]\n\n"; }
 
 }  // namespace xllm_service

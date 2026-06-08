@@ -18,6 +18,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/utils.h"
 #include "common/xllm/status.h"
+#include "http_service/anthropic_adapter.h"
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
@@ -387,12 +388,16 @@ bool Scheduler::record_new_request(
         request->model, tool_call_parser_pref, reasoning_parser_pref);
     const bool force_reasoning = get_enable_thinking_from_request(
         request->chat_template_kwargs, parser_formats.reasoning_parser);
+    auto stream_state = request->stream
+                            ? std::make_shared<AnthropicStreamState>()
+                            : nullptr;
     request->call_data = call_data;
     request->output_callback =
         [this,
          call_data,
          model = request->model,
          stream = request->stream,
+         stream_state,
          tools = std::move(tools_for_parse),
          tool_call_parser = std::move(tool_call_parser_pref),
          reasoning_parser = std::move(reasoning_parser_pref),
@@ -406,8 +411,10 @@ bool Scheduler::record_new_request(
       }
 
       if (stream) {
-        return call_data->finish_with_error(
-            "Anthropic streaming is not supported yet.");
+        return response_handler_.send_delta_to_client(call_data,
+                                                      model,
+                                                      req_output,
+                                                      stream_state.get());
       } else if (!req_output.finished_on_prefill_instance) {
         return response_handler_.send_result_to_client(call_data,
                                                        model,

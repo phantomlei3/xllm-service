@@ -436,6 +436,36 @@ bool ResponseHandler::send_delta_to_client(
   return true;
 }
 
+bool ResponseHandler::send_delta_to_client(
+    std::shared_ptr<AnthropicCallData> call_data,
+    const std::string& model,
+    const llm::RequestOutput& output,
+    AnthropicStreamState* stream_state) {
+  std::vector<xllm::proto::AnthropicStreamEvent> events;
+  auto result =
+      fill_anthropic_stream_events(model, output, stream_state, &events);
+  if (!result.ok) {
+    return call_data->finish_with_error(result.error);
+  }
+
+  for (const auto& event : events) {
+    std::string sse;
+    std::string err_msg;
+    if (!anthropic_event_sse(event, &sse, &err_msg)) {
+      LOG(ERROR) << "Anthropic stream event json failed: " << err_msg;
+      return call_data->finish_with_error(err_msg);
+    }
+    if (!call_data->write(sse)) {
+      return false;
+    }
+  }
+
+  if (output.finished) {
+    return call_data->finish();
+  }
+  return true;
+}
+
 bool ResponseHandler::send_result_to_client(
     std::shared_ptr<ChatCallData> call_data,
     int64_t created_time,
