@@ -33,6 +33,7 @@ struct AnthropicAdaptResult {
 
 struct AnthropicStreamState {
   bool message_started = false;
+  bool has_tool_call = false;
   int32_t content_block_index = -1;
   std::string last_content_block_type;
 };
@@ -56,6 +57,28 @@ AnthropicAdaptResult fill_anthropic_resp(
         nullptr);
 
 AnthropicAdaptResult fill_anthropic_stream_events(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events);
+
+AnthropicAdaptResult add_anthropic_text_delta(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    const std::string& text,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events);
+
+AnthropicAdaptResult add_anthropic_tool_delta(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    const std::string& tool_call_id,
+    const std::string& function_name,
+    const std::string& arguments,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events);
+
+AnthropicAdaptResult finish_anthropic_stream(
     const std::string& model,
     const llm::RequestOutput& request_output,
     AnthropicStreamState* state,

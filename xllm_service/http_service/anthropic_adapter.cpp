@@ -429,6 +429,32 @@ void start_text_block(AnthropicStreamState* state,
   events->push_back(std::move(event));
 }
 
+void start_tool_block(const std::string& tool_call_id,
+                      const std::string& function_name,
+                      AnthropicStreamState* state,
+                      std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  if (!state->last_content_block_type.empty()) {
+    add_block_stop(state, events);
+  }
+
+  state->last_content_block_type = "tool_use";
+  ++state->content_block_index;
+
+  xllm::proto::AnthropicStreamEvent event;
+  event.set_type("content_block_start");
+  event.set_index(state->content_block_index);
+  auto* content_block = event.mutable_content_block();
+  content_block->set_type("tool_use");
+  if (!tool_call_id.empty()) {
+    content_block->set_id(tool_call_id);
+  }
+  if (!function_name.empty()) {
+    content_block->set_name(function_name);
+  }
+  content_block->mutable_input();
+  events->push_back(std::move(event));
+}
+
 void add_text_delta(const std::string& text,
                     const AnthropicStreamState& state,
                     std::vector<xllm::proto::AnthropicStreamEvent>* events) {
@@ -444,12 +470,14 @@ void add_text_delta(const std::string& text,
 void add_message_delta(
     const llm::RequestOutput& request_output,
     const std::string& finish_reason,
+    bool has_tool_call,
     std::vector<xllm::proto::AnthropicStreamEvent>* events) {
   xllm::proto::AnthropicStreamEvent event;
   event.set_type("message_delta");
   auto* delta = event.mutable_delta();
   delta->set_stop_reason(
-      xllm::api_service::get_stream_stop_reason(true, false, finish_reason));
+      xllm::api_service::get_stream_stop_reason(
+          true, has_tool_call, finish_reason));
 
   auto* usage = event.mutable_usage();
   if (request_output.usage.has_value()) {
@@ -502,12 +530,6 @@ AnthropicAdaptResult fill_chat_req(
     const xllm::proto::AnthropicMessagesRequest& anthropic_request,
     xllm::proto::ChatRequest* chat_request,
     ChatMessages* messages) {
-  const bool streaming =
-      anthropic_request.has_stream() && anthropic_request.stream();
-  if (streaming && (anthropic_request.tools_size() > 0 ||
-                    anthropic_request.has_tool_choice())) {
-    return error_result("Anthropic streaming tools are not supported yet.");
-  }
   if (anthropic_request.max_tokens() < 0) {
     return error_result("Anthropic max_tokens must be non-negative.");
   }
@@ -599,9 +621,11 @@ AnthropicAdaptResult fill_anthropic_stream_events(
   std::string finish_reason;
   for (const auto& seq_output : request_output.outputs) {
     if (!seq_output.text.empty()) {
-      add_message_start(model, request_output, state, events);
-      start_text_block(state, events);
-      add_text_delta(seq_output.text, *state, events);
+      auto result = add_anthropic_text_delta(
+          model, request_output, seq_output.text, state, events);
+      if (!result.ok) {
+        return result;
+      }
     }
     if (seq_output.finish_reason.has_value()) {
       finish_reason = seq_output.finish_reason.value();
@@ -609,15 +633,90 @@ AnthropicAdaptResult fill_anthropic_stream_events(
   }
 
   if (request_output.finished) {
-    add_message_start(model, request_output, state, events);
-    if (state->content_block_index >= 0) {
-      add_block_stop(state, events);
-      state->last_content_block_type.clear();
-    }
-    add_message_delta(request_output, finish_reason, events);
-    add_message_stop(events);
+    return finish_anthropic_stream(model, request_output, state, events);
   }
 
+  return ok_result();
+}
+
+AnthropicAdaptResult add_anthropic_text_delta(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    const std::string& text,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  if (state == nullptr) {
+    return error_result("Anthropic stream state is required.");
+  }
+  if (events == nullptr) {
+    return error_result("Anthropic stream events output is required.");
+  }
+  if (text.empty()) {
+    return ok_result();
+  }
+
+  add_message_start(model, request_output, state, events);
+  start_text_block(state, events);
+  add_text_delta(text, *state, events);
+  return ok_result();
+}
+
+AnthropicAdaptResult add_anthropic_tool_delta(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    const std::string& tool_call_id,
+    const std::string& function_name,
+    const std::string& arguments,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  if (state == nullptr) {
+    return error_result("Anthropic stream state is required.");
+  }
+  if (events == nullptr) {
+    return error_result("Anthropic stream events output is required.");
+  }
+
+  add_message_start(model, request_output, state, events);
+  state->has_tool_call = true;
+  const bool starts_new_call = !function_name.empty();
+  if (state->last_content_block_type != "tool_use" || starts_new_call) {
+    start_tool_block(tool_call_id, function_name, state, events);
+  }
+
+  auto event = xllm::api_service::make_input_json_delta_event(
+      state->content_block_index, arguments);
+  if (event.has_value()) {
+    events->push_back(std::move(event.value()));
+  }
+  return ok_result();
+}
+
+AnthropicAdaptResult finish_anthropic_stream(
+    const std::string& model,
+    const llm::RequestOutput& request_output,
+    AnthropicStreamState* state,
+    std::vector<xllm::proto::AnthropicStreamEvent>* events) {
+  if (state == nullptr) {
+    return error_result("Anthropic stream state is required.");
+  }
+  if (events == nullptr) {
+    return error_result("Anthropic stream events output is required.");
+  }
+
+  add_message_start(model, request_output, state, events);
+  if (state->content_block_index >= 0) {
+    add_block_stop(state, events);
+    state->last_content_block_type.clear();
+  }
+
+  std::string finish_reason;
+  for (const auto& seq_output : request_output.outputs) {
+    if (seq_output.finish_reason.has_value()) {
+      finish_reason = seq_output.finish_reason.value();
+    }
+  }
+  add_message_delta(request_output, finish_reason, state->has_tool_call, events);
+  add_message_stop(events);
   return ok_result();
 }
 

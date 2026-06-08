@@ -440,12 +440,93 @@ bool ResponseHandler::send_delta_to_client(
     std::shared_ptr<AnthropicCallData> call_data,
     const std::string& model,
     const llm::RequestOutput& output,
-    AnthropicStreamState* stream_state) {
+    AnthropicStreamState* stream_state,
+    std::shared_ptr<xllm::StreamOutputParser> stream_parser) {
   std::vector<xllm::proto::AnthropicStreamEvent> events;
-  auto result =
-      fill_anthropic_stream_events(model, output, stream_state, &events);
-  if (!result.ok) {
-    return call_data->finish_with_error(result.error);
+
+  if (stream_parser && !output.outputs.empty()) {
+    stream_parser->check_resize_for_index(output.outputs.size() - 1);
+  }
+
+  for (const auto& seq_output : output.outputs) {
+    const auto& index = seq_output.index;
+    std::string cur_text = seq_output.text;
+
+    if (!cur_text.empty() && stream_parser && stream_parser->is_tool_call()) {
+      auto* parser = stream_parser->get_tool_call_parser(index);
+      if (parser) {
+        auto parse_result = parser->parse_streaming_increment(cur_text);
+        if (!parse_result.normal_text.empty()) {
+          auto result = add_anthropic_text_delta(model,
+                                                 output,
+                                                 parse_result.normal_text,
+                                                 stream_state,
+                                                 &events);
+          if (!result.ok) {
+            return call_data->finish_with_error(result.error);
+          }
+        }
+
+        for (const auto& call_item : parse_result.calls) {
+          stream_parser->set_has_tool_call(index, true);
+
+          std::string tool_call_id;
+          std::string function_name;
+          if (call_item.name.has_value()) {
+            tool_call_id = xllm::function_call::utils::generate_tool_call_id();
+            function_name = call_item.name.value();
+          }
+
+          auto result = add_anthropic_tool_delta(model,
+                                                 output,
+                                                 tool_call_id,
+                                                 function_name,
+                                                 call_item.parameters,
+                                                 stream_state,
+                                                 &events);
+          if (!result.ok) {
+            return call_data->finish_with_error(result.error);
+          }
+        }
+      }
+    } else if (!cur_text.empty()) {
+      auto result =
+          add_anthropic_text_delta(model, output, cur_text, stream_state,
+                                   &events);
+      if (!result.ok) {
+        return call_data->finish_with_error(result.error);
+      }
+    }
+
+    if (seq_output.finish_reason.has_value() && stream_parser &&
+        stream_parser->get_has_tool_call(index)) {
+      auto send_func = [&](const std::string& arguments, int tool_index) {
+        (void)tool_index;
+        auto result = add_anthropic_tool_delta(model,
+                                               output,
+                                               "",
+                                               "",
+                                               arguments,
+                                               stream_state,
+                                               &events);
+        if (!result.ok) {
+          return false;
+        }
+        return true;
+      };
+      if (!xllm::api_service::check_for_unstreamed_tool_args(
+              stream_parser, index, send_func)) {
+        return false;
+      }
+    }
+  }
+
+  if (output.finished) {
+    auto result =
+        finish_anthropic_stream(model, output, stream_state, &events);
+    if (!result.ok) {
+      return call_data->finish_with_error(result.error);
+    }
   }
 
   for (const auto& event : events) {
