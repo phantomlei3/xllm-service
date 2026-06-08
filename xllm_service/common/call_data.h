@@ -197,13 +197,7 @@ class StreamCallData : public CallData {
     return true;
   }
 
-  bool finish() {
-    io_buf_.clear();
-    io_buf_.append("data: [DONE]\n\n");
-
-    pa_->Write(io_buf_);
-    return true;
-  }
+  bool finish() { return write("data: [DONE]\n\n"); }
 
   bool is_disconnected() const override {
     if (stream_) {
