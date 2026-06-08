@@ -77,7 +77,11 @@ class ResponseHandler final {
 
   bool send_result_to_client(std::shared_ptr<AnthropicCallData> call_data,
                              const std::string& model,
-                             const llm::RequestOutput& req_output);
+                             const llm::RequestOutput& req_output,
+                             const std::vector<JsonTool>& tools = {},
+                             const std::string& tool_call_parser = "",
+                             const std::string& reasoning_parser = "",
+                             bool force_reasoning = false);
 };
 
 }  // namespace xllm_service

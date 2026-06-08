@@ -43,7 +43,9 @@ AnthropicAdaptResult fill_chat_req(
 AnthropicAdaptResult fill_anthropic_resp(
     const std::string& model,
     const llm::RequestOutput& request_output,
-    xllm::proto::AnthropicMessagesResponse* response);
+    xllm::proto::AnthropicMessagesResponse* response,
+    const google::protobuf::RepeatedPtrField<xllm::proto::ToolCall>* tool_calls =
+        nullptr);
 
 bool anthropic_json(const xllm::proto::AnthropicMessagesResponse& response,
                     std::string* json,

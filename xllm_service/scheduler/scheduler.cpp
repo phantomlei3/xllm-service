@@ -378,12 +378,25 @@ bool Scheduler::record_new_request(
     }
 
     request->latest_generate_time = absl::Now();
+    auto tools_for_parse =
+        (request->tool_choice == "none" ? std::vector<JsonTool>{}
+                                        : request->tools);
+    auto tool_call_parser_pref = options_.tool_call_parser();
+    auto reasoning_parser_pref = options_.reasoning_parser();
+    const auto parser_formats = resolve_chat_parser_formats_with_xllm(
+        request->model, tool_call_parser_pref, reasoning_parser_pref);
+    const bool force_reasoning = get_enable_thinking_from_request(
+        request->chat_template_kwargs, parser_formats.reasoning_parser);
     request->call_data = call_data;
     request->output_callback =
         [this,
          call_data,
          model = request->model,
-         stream = request->stream](
+         stream = request->stream,
+         tools = std::move(tools_for_parse),
+         tool_call_parser = std::move(tool_call_parser_pref),
+         reasoning_parser = std::move(reasoning_parser_pref),
+         force_reasoning](
             const llm::RequestOutput& req_output) mutable -> bool {
       if (req_output.status.has_value()) {
         const auto& status = req_output.status.value();
@@ -396,8 +409,13 @@ bool Scheduler::record_new_request(
         return call_data->finish_with_error(
             "Anthropic streaming is not supported yet.");
       } else if (!req_output.finished_on_prefill_instance) {
-        return response_handler_.send_result_to_client(
-            call_data, model, req_output);
+        return response_handler_.send_result_to_client(call_data,
+                                                       model,
+                                                       req_output,
+                                                       tools,
+                                                       tool_call_parser,
+                                                       reasoning_parser,
+                                                       force_reasoning);
       }
       return true;
     };

@@ -559,6 +559,10 @@ void XllmHttpServiceImpl::AnthropicMessages(
 
   auto service_request = generate_request(req_pb, "/v1/messages");
   service_request->messages = std::move(messages);
+  service_request->tools = parse_tools_from_proto(req_pb->tools());
+  if (req_pb->has_tool_choice()) {
+    service_request->tool_choice = req_pb->tool_choice();
+  }
 
   if (!scheduler_->schedule(service_request)) {
     cntl->SetFailed("Schedule request failed!");

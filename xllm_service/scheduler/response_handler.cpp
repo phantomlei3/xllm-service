@@ -579,9 +579,39 @@ bool ResponseHandler::send_result_to_client(
 bool ResponseHandler::send_result_to_client(
     std::shared_ptr<AnthropicCallData> call_data,
     const std::string& model,
-    const llm::RequestOutput& req_output) {
+    const llm::RequestOutput& req_output,
+    const std::vector<JsonTool>& tools,
+    const std::string& tool_call_parser,
+    const std::string& reasoning_parser,
+    bool force_reasoning) {
   auto& response = call_data->response();
-  auto result = fill_anthropic_resp(model, req_output, &response);
+  llm::RequestOutput output = req_output;
+  const google::protobuf::RepeatedPtrField<::xllm::proto::ToolCall>*
+      tool_calls = nullptr;
+  std::optional<google::protobuf::RepeatedPtrField<::xllm::proto::ToolCall>>
+      parsed_tool_calls;
+
+  if (!output.outputs.empty() && !output.outputs.front().text.empty()) {
+    auto parsed = parse_chat_output_with_xllm(output.outputs.front().text,
+                                             tools,
+                                             model,
+                                             output.outputs.front()
+                                                 .finish_reason.value_or(""),
+                                             tool_call_parser,
+                                             reasoning_parser,
+                                             force_reasoning,
+                                             response.GetArena());
+    output.outputs.front().text = std::move(parsed.text);
+    if (!parsed.finish_reason.empty()) {
+      output.outputs.front().finish_reason = std::move(parsed.finish_reason);
+    }
+    if (parsed.tool_calls.has_value()) {
+      parsed_tool_calls = std::move(parsed.tool_calls.value());
+      tool_calls = &parsed_tool_calls.value();
+    }
+  }
+
+  auto result = fill_anthropic_resp(model, output, &response, tool_calls);
   if (!result.ok) {
     return call_data->finish_with_error(result.error);
   }

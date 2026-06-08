@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <google/protobuf/util/json_util.h>
 #include <json2pb/pb_to_json.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <sstream>
@@ -79,6 +80,152 @@ AnthropicAdaptResult check_text_blocks(
   return ok_result();
 }
 
+std::string struct_json(const google::protobuf::Struct& proto_struct) {
+  std::string json;
+  google::protobuf::util::JsonPrintOptions options;
+  options.add_whitespace = false;
+  google::protobuf::util::MessageToJsonString(proto_struct, &json, options);
+  return json;
+}
+
+AnthropicAdaptResult tool_result_text(
+    const xllm::proto::AnthropicContentBlock& block,
+    std::string* text) {
+  if (block.has_content_string()) {
+    *text = block.content_string();
+    return ok_result();
+  }
+  if (!block.has_content_list()) {
+    text->clear();
+    return ok_result();
+  }
+
+  bool first = true;
+  text->clear();
+  for (const auto& item : block.content_list().items()) {
+    auto type_iter = item.fields().find("type");
+    auto text_iter = item.fields().find("text");
+    if (type_iter == item.fields().end() ||
+        type_iter->second.string_value() != "text" ||
+        text_iter == item.fields().end()) {
+      return error_result(
+          "Unsupported Anthropic tool_result content block.");
+    }
+    if (!first) {
+      *text += '\n';
+    }
+    *text += text_iter->second.string_value();
+    first = false;
+  }
+  return ok_result();
+}
+
+AnthropicAdaptResult add_tool_use(
+    const xllm::proto::AnthropicContentBlock& block,
+    google::protobuf::RepeatedPtrField<xllm::proto::ToolCall>*
+        proto_tool_calls,
+    Message::ToolCallVec* tool_calls) {
+  if (!block.has_id()) {
+    return error_result("Anthropic tool_use id is required.");
+  }
+  if (!block.has_name()) {
+    return error_result("Anthropic tool_use name is required.");
+  }
+
+  auto* proto_call = proto_tool_calls->Add();
+  proto_call->set_id(block.id());
+  proto_call->set_type("function");
+  auto* proto_function = proto_call->mutable_function();
+  proto_function->set_name(block.name());
+  proto_function->set_arguments(
+      block.has_input() ? struct_json(block.input()) : "{}");
+
+  Message::ToolCall tool_call;
+  tool_call.id = block.id();
+  tool_call.type = "function";
+  tool_call.function.name = block.name();
+  tool_call.function.arguments =
+      block.has_input() ? struct_json(block.input()) : "{}";
+  tool_calls->emplace_back(std::move(tool_call));
+  return ok_result();
+}
+
+AnthropicAdaptResult add_tool_result(
+    const xllm::proto::AnthropicContentBlock& block,
+    const std::string& role,
+    xllm::proto::ChatRequest* chat_request,
+    ChatMessages* messages,
+    Message::MMContentVec* content_parts) {
+  if (!block.has_id()) {
+    return error_result("Anthropic tool_result tool_use_id is required.");
+  }
+
+  std::string result_text;
+  auto text_result = tool_result_text(block, &result_text);
+  if (!text_result.ok) {
+    return text_result;
+  }
+
+  if (role == "user") {
+    auto* tool_msg = chat_request->add_messages();
+    tool_msg->set_role("tool");
+    tool_msg->set_content(result_text);
+    tool_msg->set_tool_call_id(block.id());
+
+    Message message("tool", result_text);
+    message.tool_call_id = block.id();
+    messages->emplace_back(std::move(message));
+    return ok_result();
+  }
+
+  content_parts->emplace_back("text", "Tool result: " + result_text);
+  return ok_result();
+}
+
+AnthropicAdaptResult add_tool_defs(
+    const xllm::proto::AnthropicMessagesRequest& request,
+    xllm::proto::ChatRequest* chat_request) {
+  for (const auto& anthropic_tool : request.tools()) {
+    auto* tool = chat_request->add_tools();
+    tool->set_type("function");
+    auto* function = tool->mutable_function();
+    function->set_name(anthropic_tool.name());
+    if (anthropic_tool.has_description()) {
+      function->set_description(anthropic_tool.description());
+    }
+    if (anthropic_tool.has_input_schema()) {
+      function->mutable_parameters()->CopyFrom(anthropic_tool.input_schema());
+    } else {
+      function->mutable_parameters();
+    }
+  }
+  return ok_result();
+}
+
+std::string tool_choice(
+    const xllm::proto::AnthropicMessagesRequest& request) {
+  if (!request.has_tool_choice()) {
+    return request.tools_size() > 0 ? "auto" : "none";
+  }
+
+  const auto& choice = request.tool_choice();
+  if (choice.type() == "auto") {
+    return "auto";
+  }
+  if (choice.type() == "any") {
+    return "required";
+  }
+  if (choice.type() == "tool") {
+    if (!choice.has_name()) {
+      return "auto";
+    }
+    nlohmann::json choice_json = {
+        {"type", "function"}, {"function", {{"name", choice.name()}}}};
+    return choice_json.dump();
+  }
+  return "auto";
+}
+
 AnthropicAdaptResult add_system_msg(
     const xllm::proto::AnthropicMessagesRequest& request,
     xllm::proto::ChatRequest* chat_request,
@@ -123,22 +270,61 @@ AnthropicAdaptResult add_content_msg(
       return ok_result();
     }
     case xllm::proto::AnthropicMessage::kContentBlocks: {
-      auto checked = check_text_blocks(src_message.content_blocks());
-      if (!checked.ok) {
-        return checked;
+      Message::MMContentVec mm_content;
+      Message::ToolCallVec tool_calls;
+      google::protobuf::RepeatedPtrField<xllm::proto::ToolCall>
+          proto_tool_calls;
+      for (const auto& block : src_message.content_blocks().blocks()) {
+        if (block.type() == "text" && block.has_text()) {
+          mm_content.emplace_back("text", block.text());
+        } else if (block.type() == "tool_use") {
+          auto result = add_tool_use(block, &proto_tool_calls, &tool_calls);
+          if (!result.ok) {
+            return result;
+          }
+        } else if (block.type() == "tool_result") {
+          auto result = add_tool_result(block,
+                                        src_message.role(),
+                                        chat_request,
+                                        messages,
+                                        &mm_content);
+          if (!result.ok) {
+            return result;
+          }
+        } else {
+          return error_result("Unsupported Anthropic content block type: " +
+                              block.type());
+        }
       }
 
-      Message::MMContentVec mm_content;
-      std::string flat_text = text_blocks(src_message.content_blocks(),
-                                          &mm_content);
+      std::string flat_text;
+      bool first = true;
+      for (const auto& block : mm_content) {
+        if (!first) {
+          flat_text += '\n';
+        }
+        flat_text += block.text;
+        first = false;
+      }
+      if (flat_text.empty() && proto_tool_calls.empty()) {
+        return ok_result();
+      }
+
       auto* message = chat_request->add_messages();
       message->set_role(src_message.role());
       message->set_content(flat_text);
-      if (mm_content.size() > 1) {
-        messages->emplace_back(src_message.role(), std::move(mm_content));
-      } else {
-        messages->emplace_back(src_message.role(), std::move(flat_text));
+      for (const auto& tool_call : proto_tool_calls) {
+        message->add_tool_calls()->CopyFrom(tool_call);
       }
+
+      Message dst_message(src_message.role(), flat_text);
+      if (!tool_calls.empty()) {
+        dst_message.tool_calls = std::move(tool_calls);
+      }
+      if (mm_content.size() > 1) {
+        dst_message.content = std::move(mm_content);
+      }
+      messages->emplace_back(std::move(dst_message));
       return ok_result();
     }
     case xllm::proto::AnthropicMessage::MESSAGE_CONTENT_NOT_SET:
@@ -220,10 +406,6 @@ AnthropicAdaptResult fill_chat_req(
   if (anthropic_request.has_stream() && anthropic_request.stream()) {
     return error_result("Anthropic streaming is not supported yet.");
   }
-  if (anthropic_request.tools_size() > 0 ||
-      anthropic_request.has_tool_choice()) {
-    return error_result("Anthropic tools are not supported yet.");
-  }
   if (anthropic_request.max_tokens() < 0) {
     return error_result("Anthropic max_tokens must be non-negative.");
   }
@@ -234,6 +416,11 @@ AnthropicAdaptResult fill_chat_req(
   chat_request->Clear();
   messages->clear();
   fill_generation_params(anthropic_request, chat_request);
+  auto tool_result = add_tool_defs(anthropic_request, chat_request);
+  if (!tool_result.ok) {
+    return tool_result;
+  }
+  chat_request->set_tool_choice(tool_choice(anthropic_request));
 
   auto system_result = add_system_msg(anthropic_request, chat_request, messages);
   if (!system_result.ok) {
@@ -251,7 +438,9 @@ AnthropicAdaptResult fill_chat_req(
 AnthropicAdaptResult fill_anthropic_resp(
     const std::string& model,
     const llm::RequestOutput& request_output,
-    xllm::proto::AnthropicMessagesResponse* response) {
+    xllm::proto::AnthropicMessagesResponse* response,
+    const google::protobuf::RepeatedPtrField<xllm::proto::ToolCall>*
+        tool_calls) {
   response->Clear();
   response->set_id(request_output.request_id);
   response->set_type("message");
@@ -273,6 +462,23 @@ AnthropicAdaptResult fill_anthropic_resp(
   auto* text_block = response->add_content();
   text_block->set_type("text");
   text_block->set_text(output.text);
+  if (tool_calls == nullptr) {
+    return ok_result();
+  }
+  for (const auto& tool_call : *tool_calls) {
+    auto* tool_block = response->add_content();
+    tool_block->set_type("tool_use");
+    tool_block->set_id(tool_call.id());
+    tool_block->set_name(tool_call.function().name());
+    if (!tool_call.function().arguments().empty()) {
+      auto status = google::protobuf::util::JsonStringToMessage(
+          tool_call.function().arguments(), tool_block->mutable_input());
+      if (!status.ok()) {
+        return error_result("Invalid Anthropic tool call arguments JSON: " +
+                            status.ToString());
+      }
+    }
+  }
   return ok_result();
 }
 

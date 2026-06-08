@@ -56,6 +56,16 @@ void expect_reject(const std::string& json,
   EXPECT_TRUE(messages.empty());
 }
 
+std::string chat_tool_choice(const std::string& tool_choice_json) {
+  auto request = parse_request(tool_choice_json);
+  xllm::proto::ChatRequest chat_request;
+  ChatMessages messages;
+  auto result = adapt_request(request, &chat_request, &messages);
+  EXPECT_TRUE(result.ok) << result.error;
+  EXPECT_TRUE(chat_request.has_tool_choice());
+  return chat_request.tool_choice();
+}
+
 TEST(AnthropicAdapterTest, MapsStringSystemMessagesAndParams) {
   auto request = parse_request(R"({
     "model": "test-model",
@@ -256,6 +266,163 @@ TEST(AnthropicAdapterTest, RejectsUnknownMessageBlocks) {
                 "Unsupported Anthropic content block type: audio");
 }
 
+TEST(AnthropicAdapterTest, MapsToolsAndDefaultToolChoices) {
+  auto request = parse_request(R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get weather",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"}
+          },
+          "required": ["city"]
+        }
+      }
+    ],
+    "messages": [
+      {"role": "user", "content": "weather"}
+    ]
+  })");
+
+  xllm::proto::ChatRequest chat_request;
+  ChatMessages messages;
+  auto result = adapt_request(request, &chat_request, &messages);
+  ASSERT_TRUE(result.ok) << result.error;
+
+  ASSERT_EQ(chat_request.tools_size(), 1);
+  const auto& tool = chat_request.tools(0);
+  EXPECT_EQ(tool.type(), "function");
+  EXPECT_EQ(tool.function().name(), "get_weather");
+  EXPECT_EQ(tool.function().description(), "Get weather");
+  ASSERT_TRUE(tool.function().has_parameters());
+  EXPECT_EQ(tool.function()
+                .parameters()
+                .fields()
+                .at("properties")
+                .struct_value()
+                .fields()
+                .at("city")
+                .struct_value()
+                .fields()
+                .at("type")
+                .string_value(),
+            "string");
+  ASSERT_TRUE(chat_request.has_tool_choice());
+  EXPECT_EQ(chat_request.tool_choice(), "auto");
+}
+
+TEST(AnthropicAdapterTest, MapsToolChoiceRules) {
+  const std::string base = R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "messages": [{"role": "user", "content": "hello"}])";
+
+  EXPECT_EQ(chat_tool_choice(base + "}"), "none");
+  EXPECT_EQ(chat_tool_choice(base + R"(,
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
+  })"),
+            "auto");
+  EXPECT_EQ(chat_tool_choice(base + R"(,
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    "tool_choice": {"type": "auto"}
+  })"),
+            "auto");
+  EXPECT_EQ(chat_tool_choice(base + R"(,
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    "tool_choice": {"type": "any"}
+  })"),
+            "required");
+  auto specific = nlohmann::json::parse(chat_tool_choice(base + R"(,
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    "tool_choice": {"type": "tool", "name": "lookup"}
+  })"));
+  EXPECT_EQ(specific["type"], "function");
+  EXPECT_EQ(specific["function"]["name"], "lookup");
+  EXPECT_EQ(chat_tool_choice(base + R"(,
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    "tool_choice": {"type": "mystery"}
+  })"),
+            "auto");
+}
+
+TEST(AnthropicAdapterTest, MapsToolUseAndToolResultHistory) {
+  auto request = parse_request(R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "messages": [
+      {
+        "role": "assistant",
+        "content": [
+          {"type": "text", "text": "I will call a tool."},
+          {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "get_weather",
+            "input": {"city": "Beijing"}
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "sunny"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "fallback"
+          }
+        ]
+      }
+    ]
+  })");
+
+  xllm::proto::ChatRequest chat_request;
+  ChatMessages messages;
+  auto result = adapt_request(request, &chat_request, &messages);
+  ASSERT_TRUE(result.ok) << result.error;
+
+  ASSERT_EQ(chat_request.messages_size(), 3);
+  const auto& assistant = chat_request.messages(0);
+  EXPECT_EQ(assistant.role(), "assistant");
+  EXPECT_EQ(assistant.content(), "I will call a tool.");
+  ASSERT_EQ(assistant.tool_calls_size(), 1);
+  EXPECT_EQ(assistant.tool_calls(0).id(), "toolu_1");
+  EXPECT_EQ(assistant.tool_calls(0).type(), "function");
+  EXPECT_EQ(assistant.tool_calls(0).function().name(), "get_weather");
+  EXPECT_EQ(assistant.tool_calls(0).function().arguments(),
+            R"({"city":"Beijing"})");
+
+  const auto& tool_result = chat_request.messages(1);
+  EXPECT_EQ(tool_result.role(), "tool");
+  EXPECT_EQ(tool_result.tool_call_id(), "toolu_1");
+  EXPECT_EQ(tool_result.content(), "sunny");
+
+  const auto& assistant_result = chat_request.messages(2);
+  EXPECT_EQ(assistant_result.role(), "assistant");
+  EXPECT_EQ(assistant_result.content(), "Tool result: fallback");
+
+  ASSERT_EQ(messages.size(), 3);
+  EXPECT_EQ(messages[0].role, "assistant");
+  ASSERT_TRUE(messages[0].tool_calls.has_value());
+  ASSERT_EQ(messages[0].tool_calls->size(), 1);
+  EXPECT_EQ((*messages[0].tool_calls)[0].id, "toolu_1");
+  EXPECT_EQ(messages[1].role, "tool");
+  EXPECT_EQ(messages[1].tool_call_id, "toolu_1");
+}
+
 TEST(AnthropicAdapterTest, BuildsNonStreamAnthropicJson) {
   llm::RequestOutput output;
   output.request_id = "anthropiccmpl-test";
@@ -291,6 +458,43 @@ TEST(AnthropicAdapterTest, BuildsNonStreamAnthropicJson) {
   EXPECT_EQ(json["usage"]["input_tokens"], 3);
   EXPECT_EQ(json["usage"]["output_tokens"], 4);
   EXPECT_FALSE(json["usage"].contains("total_tokens"));
+}
+
+TEST(AnthropicAdapterTest, BuildsToolUseAnthropicJson) {
+  llm::RequestOutput output;
+  output.request_id = "anthropiccmpl-test";
+  output.finished = true;
+  llm::SequenceOutput seq;
+  seq.index = 0;
+  seq.text = "";
+  seq.finish_reason = "tool_calls";
+  output.outputs.push_back(std::move(seq));
+
+  google::protobuf::RepeatedPtrField<xllm::proto::ToolCall> tool_calls;
+  auto* tool_call = tool_calls.Add();
+  tool_call->set_id("call_1");
+  tool_call->set_type("function");
+  tool_call->mutable_function()->set_name("get_weather");
+  tool_call->mutable_function()->set_arguments(R"({"city":"Beijing"})");
+
+  xllm::proto::AnthropicMessagesResponse response;
+  auto result =
+      fill_anthropic_resp("test-model", output, &response, &tool_calls);
+  ASSERT_TRUE(result.ok) << result.error;
+
+  std::string json_str;
+  std::string error;
+  ASSERT_TRUE(anthropic_json(response, &json_str, &error)) << error;
+  auto json = nlohmann::json::parse(json_str);
+
+  EXPECT_EQ(json["stop_reason"], "tool_use");
+  ASSERT_EQ(json["content"].size(), 2);
+  EXPECT_EQ(json["content"][0]["type"], "text");
+  EXPECT_EQ(json["content"][0]["text"], "");
+  EXPECT_EQ(json["content"][1]["type"], "tool_use");
+  EXPECT_EQ(json["content"][1]["id"], "call_1");
+  EXPECT_EQ(json["content"][1]["name"], "get_weather");
+  EXPECT_EQ(json["content"][1]["input"]["city"], "Beijing");
 }
 
 TEST(AnthropicAdapterTest, MapsLengthStopReason) {
