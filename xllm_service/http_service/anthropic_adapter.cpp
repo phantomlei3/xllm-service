@@ -227,6 +227,9 @@ AnthropicAdaptResult fill_chat_req(
   if (anthropic_request.max_tokens() < 0) {
     return error_result("Anthropic max_tokens must be non-negative.");
   }
+  if (anthropic_request.messages_size() == 0) {
+    return error_result("Messages is empty!");
+  }
 
   chat_request->Clear();
   messages->clear();

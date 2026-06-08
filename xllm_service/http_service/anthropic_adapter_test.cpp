@@ -36,6 +36,26 @@ const std::string& text_content(const Message& message) {
   return std::get<std::string>(message.content);
 }
 
+AnthropicAdaptResult adapt_request(
+    const xllm::proto::AnthropicMessagesRequest& request,
+    xllm::proto::ChatRequest* chat_request,
+    ChatMessages* messages) {
+  return fill_chat_req(request, chat_request, messages);
+}
+
+void expect_reject(const std::string& json,
+                   const std::string& expected_error) {
+  auto request = parse_request(json);
+  xllm::proto::ChatRequest chat_request;
+  ChatMessages messages;
+  auto result = adapt_request(request, &chat_request, &messages);
+  EXPECT_FALSE(result.ok);
+  EXPECT_NE(result.error.find(expected_error), std::string::npos)
+      << result.error;
+  EXPECT_EQ(chat_request.messages_size(), 0);
+  EXPECT_TRUE(messages.empty());
+}
+
 TEST(AnthropicAdapterTest, MapsStringSystemMessagesAndParams) {
   auto request = parse_request(R"({
     "model": "test-model",
@@ -123,6 +143,81 @@ TEST(AnthropicAdapterTest, MapsTextBlocksForSystemAndMessages) {
   EXPECT_EQ(content[1].text, "world");
 }
 
+TEST(AnthropicAdapterTest, PreservesAssistantRoleForTextBlocks) {
+  auto request = parse_request(R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "messages": [
+      {"role": "user", "content": "question"},
+      {
+        "role": "assistant",
+        "content": [
+          {"type": "text", "text": "partial"},
+          {"type": "text", "text": "answer"}
+        ]
+      }
+    ]
+  })");
+
+  xllm::proto::ChatRequest chat_request;
+  ChatMessages messages;
+  auto result = adapt_request(request, &chat_request, &messages);
+  ASSERT_TRUE(result.ok) << result.error;
+
+  ASSERT_EQ(chat_request.messages_size(), 2);
+  EXPECT_EQ(chat_request.messages(1).role(), "assistant");
+  EXPECT_EQ(chat_request.messages(1).content(), "partial\nanswer");
+  ASSERT_EQ(messages.size(), 2);
+  EXPECT_EQ(messages[1].role, "assistant");
+}
+
+TEST(AnthropicAdapterTest, IgnoresUnknownJsonFields) {
+  auto request = parse_request(R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "metadata": {"trace": "x"},
+    "unknown_top_level": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello",
+        "unknown_message_field": {"ignored": true}
+      }
+    ]
+  })");
+
+  xllm::proto::ChatRequest chat_request;
+  ChatMessages messages;
+  auto result = adapt_request(request, &chat_request, &messages);
+  ASSERT_TRUE(result.ok) << result.error;
+  ASSERT_EQ(chat_request.messages_size(), 1);
+  EXPECT_EQ(chat_request.messages(0).content(), "hello");
+}
+
+TEST(AnthropicAdapterTest, RejectsEmptyMessages) {
+  expect_reject(R"({
+    "model": "test-model",
+    "system": "system only",
+    "max_tokens": 8,
+    "messages": []
+  })",
+                "Messages is empty");
+}
+
+TEST(AnthropicAdapterTest, RejectsSystemImageBlocks) {
+  expect_reject(R"({
+    "model": "test-model",
+    "system": [
+      {"type": "image", "source": {"type": "base64", "data": "x"}}
+    ],
+    "max_tokens": 8,
+    "messages": [
+      {"role": "user", "content": "hello"}
+    ]
+  })",
+                "Unsupported Anthropic content block type: image");
+}
+
 TEST(AnthropicAdapterTest, RejectsNonTextBlocks) {
   auto request = parse_request(R"({
     "model": "test-model",
@@ -143,6 +238,22 @@ TEST(AnthropicAdapterTest, RejectsNonTextBlocks) {
   EXPECT_FALSE(result.ok);
   EXPECT_NE(result.error.find("Unsupported Anthropic content block type"),
             std::string::npos);
+}
+
+TEST(AnthropicAdapterTest, RejectsUnknownMessageBlocks) {
+  expect_reject(R"({
+    "model": "test-model",
+    "max_tokens": 8,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "audio", "audio": {"url": "x"}}
+        ]
+      }
+    ]
+  })",
+                "Unsupported Anthropic content block type: audio");
 }
 
 TEST(AnthropicAdapterTest, BuildsNonStreamAnthropicJson) {
