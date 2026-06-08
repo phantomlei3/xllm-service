@@ -366,6 +366,56 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
 }
 
 bool Scheduler::record_new_request(
+    std::shared_ptr<AnthropicCallData> call_data,
+    std::shared_ptr<Request> request) {
+  {
+    std::lock_guard<std::mutex> guard(request_mutex_);
+    if (requests_.find(request->service_request_id) != requests_.end()) {
+      LOG(ERROR) << "The request ID already exists. Requests with the same ID "
+                    "are not allowed. "
+                 << request->service_request_id;
+      return false;
+    }
+
+    request->latest_generate_time = absl::Now();
+    request->call_data = call_data;
+    request->output_callback =
+        [this,
+         call_data,
+         model = request->model,
+         stream = request->stream](
+            const llm::RequestOutput& req_output) mutable -> bool {
+      if (req_output.status.has_value()) {
+        const auto& status = req_output.status.value();
+        if (!status.ok()) {
+          return call_data->finish_with_error(status.message());
+        }
+      }
+
+      if (stream) {
+        return call_data->finish_with_error(
+            "Anthropic streaming is not supported yet.");
+      } else if (!req_output.finished_on_prefill_instance) {
+        return response_handler_.send_result_to_client(
+            call_data, model, req_output);
+      }
+      return true;
+    };
+    requests_.emplace(request->service_request_id, request);
+    COUNTER_INC(server_request_in_total);
+  }
+
+  {
+    std::lock_guard<std::mutex> guard(thread_map_mutex_);
+    remote_requests_output_thread_map_[request->service_request_id] =
+        next_thread_idx;
+    next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+  }
+
+  return true;
+}
+
+bool Scheduler::record_new_request(
     std::shared_ptr<CompletionCallData> call_data,
     std::shared_ptr<Request> request) {
   {

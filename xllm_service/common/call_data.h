@@ -24,6 +24,7 @@ limitations under the License.
 #include <functional>
 #include <string>
 
+#include "anthropic.pb.h"
 #include "chat.pb.h"
 #include "completion.pb.h"
 
@@ -243,5 +244,14 @@ using CompletionCallData = StreamCallData<::xllm::proto::CompletionRequest,
 
 using ChatCallData =
     StreamCallData<::xllm::proto::ChatRequest, ::xllm::proto::ChatResponse>;
+
+class AnthropicCallData
+    : public StreamCallData<::xllm::proto::ChatRequest,
+                            ::xllm::proto::AnthropicMessagesResponse> {
+ public:
+  using Base = StreamCallData<::xllm::proto::ChatRequest,
+                              ::xllm::proto::AnthropicMessagesResponse>;
+  using Base::Base;
+};
 
 }  // namespace xllm_service

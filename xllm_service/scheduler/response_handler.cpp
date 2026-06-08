@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <optional>
 
+#include "http_service/anthropic_adapter.h"
 #include "scheduler/xllm_chat_parse_bridge.h"
 #include "xllm/xllm/api_service/stream_output_parser.h"
 #include "xllm/xllm/api_service/utils.h"
@@ -573,6 +574,25 @@ bool ResponseHandler::send_result_to_client(
   }
 
   return call_data->write_and_finish(response);
+}
+
+bool ResponseHandler::send_result_to_client(
+    std::shared_ptr<AnthropicCallData> call_data,
+    const std::string& model,
+    const llm::RequestOutput& req_output) {
+  auto& response = call_data->response();
+  auto result = fill_anthropic_resp(model, req_output, &response);
+  if (!result.ok) {
+    return call_data->finish_with_error(result.error);
+  }
+
+  std::string json_output;
+  std::string err_msg;
+  if (!anthropic_json(response, &json_output, &err_msg)) {
+    LOG(ERROR) << "Anthropic response json failed: " << err_msg;
+    return call_data->finish_with_error(err_msg);
+  }
+  return call_data->write_and_finish(json_output);
 }
 
 }  // namespace xllm_service

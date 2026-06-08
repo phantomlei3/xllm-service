@@ -74,6 +74,10 @@ class ResponseHandler final {
                              int64_t created_time,
                              const std::string& model,
                              const llm::RequestOutput& req_output);
+
+  bool send_result_to_client(std::shared_ptr<AnthropicCallData> call_data,
+                             const std::string& model,
+                             const llm::RequestOutput& req_output);
 };
 
 }  // namespace xllm_service
